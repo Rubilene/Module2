@@ -1,0 +1,9 @@
+logs/
+data/outputs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+coverage.xml
+*.egg-info/
+dist/

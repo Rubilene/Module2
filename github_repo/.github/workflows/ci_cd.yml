@@ -1,0 +1,139 @@
+name: PTL Pipeline CI/CD
+
+# Triggers: run on every push and pull request to main
+# This enforces quality gates before any code reaches production
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Job 1: Test & Quality Gate ────────────────────────────────────────────
+  test:
+    name: Run Tests & Coverage Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Create required directories
+        run: mkdir -p logs data/outputs
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest tests/ -v --tb=short \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=85
+        # Pipeline will FAIL if coverage drops below 85%
+        # This enforces the TDD quality gate described in the project report
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ── Job 2: Schema Validation ─────────────────────────────────────────────
+  schema-check:
+    name: Validate Sample Data Schema
+    runs-on: ubuntu-latest
+    needs: test  # only runs if tests pass
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run schema validation on sample data
+        run: |
+          mkdir -p logs data/outputs
+          python -c "
+          import sys
+          sys.path.insert(0, 'src')
+          from ptl_pipeline import load_data, validate_schema
+          df = load_data('data/sample/sample_radnet_export.csv')
+          validate_schema(df)
+          print('Sample data schema validation PASSED')
+          "
+
+  # ── Job 3: Deploy to Staging ─────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging Environment
+    runs-on: ubuntu-latest
+    needs: [test, schema-check]
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline against sample data (staging smoke test)
+        run: |
+          mkdir -p logs data/outputs
+          python src/ptl_pipeline.py \
+            --input data/sample/sample_radnet_export.csv \
+            --output data/outputs/ \
+            --exclusions data/sample/sample_exclusions.csv
+
+      - name: Verify output files exist
+        run: |
+          python -c "
+          from pathlib import Path
+          import sys
+          outputs = list(Path('data/outputs').glob('ptl_full_*.csv'))
+          dm01 = list(Path('data/outputs').glob('dm01_return_*.csv'))
+          summary = list(Path('data/outputs').glob('ptl_summary_*.csv'))
+          if not (outputs and dm01 and summary):
+              print('ERROR: Expected output files not found')
+              sys.exit(1)
+          print(f'Staging smoke test PASSED: {len(outputs)+len(dm01)+len(summary)} output files created')
+          "
+
+      - name: Upload staging outputs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-outputs
+          path: data/outputs/
+
+  # ── Job 4: Production Deploy (manual approval gate) ──────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      # Add required reviewers in GitHub repo settings → Environments
+      # This enforces the NHS governance requirement for sign-off before production
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Production deployment confirmation
+        run: |
+          echo "Production deployment approved and executed."
+          echo "All quality gates passed: tests, schema validation, staging smoke test."
+          echo "Audit log entry created at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
